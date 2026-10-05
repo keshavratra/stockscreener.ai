@@ -6,6 +6,8 @@ Simple web UI for screener.py. Keep this file in the same folder as screener.py.
 
 It opens in your browser at http://localhost:8501 and runs only on your computer.
 """
+import csv
+import io
 import json
 import os
 import re
@@ -40,6 +42,43 @@ def screen_one(client, lookup, ticker):
     return row
 
 
+EMAIL_RE = re.compile(r"[^@\s<>()]+@[^@\s<>()]+\.[^@\s<>()]+")
+TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,5}(-[A-Z0-9]{1,2})?$")
+HEADER_WORDS = {"TICKER", "TICKERS", "SYMBOL", "SYMBOLS", "STOCK", "STOCKS"}
+
+
+def clean_tickers(tokens):
+    """Uppercase, turn BRK.B into BRK-B (the SEC's spelling), drop junk and repeats."""
+    out = []
+    for tok in tokens:
+        t = tok.strip().strip("\"'$").upper().replace(".", "-").replace("/", "-")
+        if t and t not in HEADER_WORDS and TICKER_RE.match(t) and t not in out:
+            out.append(t)
+    return out
+
+
+def tickers_from_file(name, data):
+    """Read tickers from an uploaded .txt or .csv file."""
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    if not name.lower().endswith(".csv"):
+        return clean_tickers(re.split(r"[\s,;]+", text))
+    rows = [r for r in csv.reader(io.StringIO(text)) if any(c.strip() for c in r)]
+    if not rows:
+        return []
+    header = [c.strip().upper() for c in rows[0]]
+    col = next((i for i, h in enumerate(header) if h in HEADER_WORDS), None)
+    if col is not None:                      # a column labeled Ticker / Symbol
+        cells = [r[col] for r in rows[1:] if len(r) > col]
+    elif len(rows) == 1 or all(len(r) == 1 for r in rows):
+        cells = [c for r in rows for c in r]  # one row or one column of tickers
+    else:                                     # a table with no label: first column
+        cells = [r[0] for r in rows]
+    return clean_tickers(cells)
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def cik_map():
     return screener.load_cik_map()
@@ -48,10 +87,11 @@ def cik_map():
 # ----------------------------------------------------------------- settings
 with st.sidebar:
     st.header("Settings")
-    sec_contact = st.text_input("SEC contact (name and email)",
-                                value=os.environ.get("SEC_USER_AGENT", ""),
-                                help="The SEC requires a contact on every data request.")
-    st.caption("Filled in automatically if you set SEC_USER_AGENT with setx.")
+    _saved = EMAIL_RE.search(os.environ.get("SEC_USER_AGENT", ""))
+    email = st.text_input("Your email", value=_saved.group(0) if _saved else "",
+                          placeholder="you@example.com",
+                          help="The SEC requires a contact email on every data request. "
+                               "It is sent only to the SEC.").strip()
 
 # The Claude API key is never shown here; it is read from the environment.
 api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -62,7 +102,18 @@ st.caption("Rates financial strength from each company's latest 10-K and 10-Q.")
 
 raw = st.text_area("Stocks to screen", placeholder="AAPL, MSFT, F",
                    help="Ticker symbols separated by commas, spaces, or new lines.")
-tickers = list(dict.fromkeys(t.upper() for t in re.split(r"[\s,;]+", raw) if t))
+upload = st.file_uploader("Or upload a list (.csv or .txt)", type=["csv", "txt"],
+                          help="A plain list of tickers, or a spreadsheet saved as CSV "
+                               "with a column named Ticker or Symbol.")
+tickers = clean_tickers(re.split(r"[\s,;]+", raw))
+if upload is not None:
+    from_file = tickers_from_file(upload.name, upload.getvalue())
+    if not from_file:
+        st.warning(f"No ticker symbols found in {upload.name}.")
+    tickers = list(dict.fromkeys(tickers + from_file))
+if tickers:
+    shown = ", ".join(tickers[:15]) + (" ..." if len(tickers) > 15 else "")
+    st.caption(f"{len(tickers)} stock{'s' if len(tickers) != 1 else ''} to screen: {shown}")
 run = st.button("Screen stocks", type="primary", disabled=not tickers)
 
 if run:
@@ -71,10 +122,10 @@ if run:
                  '`setx ANTHROPIC_API_KEY "sk-ant-..."`, then close the terminal, '
                  "open a new one, and start the app again.")
         st.stop()
-    if not sec_contact:
-        st.error("Fill in the SEC contact in the sidebar first.")
+    if not EMAIL_RE.fullmatch(email):
+        st.error("Enter a valid email in the sidebar first. The SEC requires one.")
         st.stop()
-    os.environ["SEC_USER_AGENT"] = sec_contact
+    os.environ["SEC_USER_AGENT"] = f"StockScreener {email}"
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     try:
