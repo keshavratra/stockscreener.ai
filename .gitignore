@@ -1,0 +1,6 @@
+﻿results.json
+__pycache__/
+.venv/
+venv/
+screener/
+.env
