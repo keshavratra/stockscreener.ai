@@ -8,7 +8,6 @@ It opens in your browser at http://localhost:8501 and runs only on your computer
 """
 import csv
 import io
-import json
 import os
 import re
 from datetime import date
@@ -21,30 +20,7 @@ st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="center
 
 GROUPS = [("buy", "Buy", "🟢"), ("watch", "Watch", "🟡"), ("avoid", "Avoid", "🔴")]
 
-
-def screen_one(client, lookup, ticker):
-    """Screen one ticker. Failures come back as row['error'] instead of raising."""
-    row = {"ticker": ticker}
-    try:
-        if ticker not in lookup:
-            raise ValueError("ticker not found on SEC EDGAR")
-        cik, name = lookup[ticker]
-        filings = screener.latest_filings(cik)
-        if "10-K" not in filings:
-            raise ValueError("no 10-K on file (foreign filers use 20-F / 40-F)")
-        facts = screener.sec_get(
-            f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json")
-        financials = screener.extract_financials(
-            facts, filings.get("10-Q", {}).get("accession"))
-        row.update(company=name, filings=filings,
-                   **screener.assess(client, ticker, name, filings, financials))
-    except Exception as exc:
-        row["error"] = str(exc)
-    return row
-
-
 EMAIL_RE = re.compile(r"[^@\s<>()]+@[^@\s<>()]+\.[^@\s<>()]+")
-TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,5}(-[A-Z0-9]{1,2})?$")
 HEADER_WORDS = {"TICKER", "TICKERS", "SYMBOL", "SYMBOLS", "STOCK", "STOCKS"}
 
 
@@ -53,7 +29,7 @@ def clean_tickers(tokens):
     out = []
     for tok in tokens:
         t = tok.strip().strip("\"'$").upper().replace(".", "-").replace("/", "-")
-        if t and t not in HEADER_WORDS and TICKER_RE.match(t) and t not in out:
+        if t and t not in HEADER_WORDS and screener.TICKER_OK.match(t) and t not in out:
             out.append(t)
     return out
 
@@ -93,15 +69,25 @@ with st.sidebar:
                           placeholder="you@example.com",
                           help="The SEC requires a contact email on every data request. "
                                "It is sent only to the SEC.").strip()
+    st.subheader("ETFs")
+    av_key = st.text_input("Alpha Vantage key", type="password",
+                           value=os.environ.get("ALPHAVANTAGE_API_KEY", ""),
+                           help="Only needed for ETFs: it supplies each fund's list of "
+                                "holdings. Free at alphavantage.co/support/#api-key").strip()
+    etf_top = st.number_input("Holdings to screen per ETF", min_value=0, max_value=5000,
+                              value=screener.ETF_TOP_DEFAULT, step=5,
+                              help="Biggest holdings first. 0 screens every holding, "
+                                   "which for a fund like SPY is about 500 companies.")
 
 # The Claude API key is never shown here; it is read from the environment.
 api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # -------------------------------------------------------------------- input
 st.title("📈 Stock Screener")
-st.caption("Rates financial strength from each company's latest 10-K and 10-Q.")
+st.caption("Rates financial strength from each company's latest 10-K and 10-Q. "
+           "Enter an ETF to screen the companies it holds.")
 
-raw = st.text_area("Stocks to screen", placeholder="AAPL, MSFT, F",
+raw = st.text_area("Stocks or ETFs to screen", placeholder="AAPL, MSFT, SPY",
                    help="Ticker symbols separated by commas, spaces, or new lines.")
 upload = st.file_uploader("Or upload a list (.csv or .txt)", type=["csv", "txt"],
                           help="A plain list of tickers, or a spreadsheet saved as CSV "
@@ -114,7 +100,7 @@ if upload is not None:
     tickers = list(dict.fromkeys(tickers + from_file))
 if tickers:
     shown = ", ".join(tickers[:15]) + (" ..." if len(tickers) > 15 else "")
-    st.caption(f"{len(tickers)} stock{'s' if len(tickers) != 1 else ''} to screen: {shown}")
+    st.caption(f"{len(tickers)} symbol{'s' if len(tickers) != 1 else ''} to screen: {shown}")
 run = st.button("Screen stocks", type="primary", disabled=not tickers)
 
 if run:
@@ -134,30 +120,59 @@ if run:
     except Exception as exc:
         st.error(f"Could not reach the SEC: {exc}")
         st.stop()
-    results = []
-    bar = st.progress(0.0)
-    for i, ticker in enumerate(tickers):
-        bar.progress(i / len(tickers), text=f"Analyzing {ticker} ({i + 1} of {len(tickers)})")
-        results.append(screen_one(client, lookup, ticker))
+    bar = st.progress(0.0, text="Looking up tickers and ETF holdings")
+    results, etfs = screener.screen(
+        tickers, client=client, cik_map=lookup, av_key=av_key, etf_top=int(etf_top),
+        progress=lambda i, n, t: bar.progress(i / n, text=f"Analyzing {t} ({i + 1} of {n})"))
     bar.empty()
     st.session_state["results"] = results
+    st.session_state["etfs"] = etfs
 
 # ------------------------------------------------------------------ results
 results = st.session_state.get("results")
+etfs = st.session_state.get("etfs") or []
 if results:
     ok = sorted((r for r in results if "error" not in r), key=lambda r: -r["score"])
     errors = [r for r in results if "error" in r]
+    score_col = st.column_config.ProgressColumn("Score", min_value=0, max_value=10,
+                                                format="%d / 10")
 
-    if ok:
-        st.subheader("Summary")
+    for etf in etfs:
+        info = screener.etf_breakdown(etf, results)
+        st.subheader(f"ETF: {etf['ticker']}")
+        st.caption((f"{etf['name']}  \n" if etf["name"] else "") + screener.etf_scope(etf))
+        w = info["weights"]
+        cols = st.columns(4)
+        cols[0].metric("🟢 Buy", f"{w['buy']:.1f}%")
+        cols[1].metric("🟡 Watch", f"{w['watch']:.1f}%")
+        cols[2].metric("🔴 Avoid", f"{w['avoid']:.1f}%")
+        cols[3].metric("Weighted score", "n/a" if info["weighted_score"] is None
+                       else f"{info['weighted_score']:.1f} / 10")
+        note = "Percentages are each rating's share of the whole fund."
+        if w["skipped"]:
+            note += f" Another {w['skipped']:.1f}% could not be rated (see Skipped)."
+        st.caption(note)
+        st.dataframe(
+            [{"Weight": h["weight_pct"], "Ticker": h["ticker"], "Company": h["company"],
+              "Recommendation": (h["recommendation"] or "skipped").capitalize(),
+              "Strength": (h["financial_strength"] or "").capitalize(),
+              "Score": h["score"]} for h in info["rows"]],
+            hide_index=True, width="stretch",
+            column_config={"Score": score_col,
+                           "Weight": st.column_config.NumberColumn(
+                               "Weight", format="%.2f%%",
+                               help="Percent of the fund held in this company")},
+        )
+
+    listed = [r for r in ok if not r.get("etfs")] if etfs else ok
+    if listed:
+        st.subheader("Individual stocks" if etfs else "Summary")
         st.dataframe(
             [{"Ticker": r["ticker"], "Company": r["company"],
               "Recommendation": r["recommendation"].capitalize(),
               "Strength": r["financial_strength"].capitalize(),
-              "Score": r["score"]} for r in ok],
-            hide_index=True, width="stretch",
-            column_config={"Score": st.column_config.ProgressColumn(
-                "Score", min_value=0, max_value=10, format="%d / 10")},
+              "Score": r["score"]} for r in listed],
+            hide_index=True, width="stretch", column_config={"Score": score_col},
         )
 
     for key, label, dot in GROUPS:
@@ -167,8 +182,9 @@ if results:
         st.subheader(f"{dot} {label}")
         for r in group:
             with st.container(border=True):
+                tag = f" · {screener.etf_tag(r)}" if r.get("etfs") else ""
                 st.markdown(f"**{r['ticker']}** · {r['company']}  \n"
-                            f"{r['financial_strength'].capitalize()} · {r['score']}/10")
+                            f"{r['financial_strength'].capitalize()} · {r['score']}/10{tag}")
                 st.markdown("\n".join(f"- {b}" for b in r["reasoning"]))
                 if r["data_gaps"].strip().lower() != "none":
                     st.caption(f"Data gaps: {r['data_gaps']}")
@@ -181,16 +197,17 @@ if results:
     if errors:
         st.subheader("Skipped")
         for r in errors:
-            st.warning(f"**{r['ticker']}**: {r['error']}")
+            tag = f" ({screener.etf_tag(r)})" if r.get("etfs") else ""
+            st.warning(f"**{r['ticker']}**{tag}: {r['error']}")
 
     left, right = st.columns(2)
     try:
-        left.download_button("Download report (PDF)", screener.build_pdf(results),
+        left.download_button("Download report (PDF)", screener.build_pdf(results, etfs),
                              file_name=f"stock-screen-{date.today()}.pdf",
                              mime="application/pdf", type="primary")
     except Exception as exc:
         left.warning(f"PDF unavailable: {exc}")
-    right.download_button("Download full results (JSON)", json.dumps(results, indent=2),
+    right.download_button("Download full results (JSON)", screener.to_json(results, etfs),
                           file_name="results.json", mime="application/json")
     st.caption("A “buy” here means the business is financially strong. No price or "
                "valuation data is used, and this is not financial advice.")
