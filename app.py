@@ -19,6 +19,14 @@ import screener
 st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="centered")
 
 GROUPS = [("buy", "Buy", "🟢"), ("watch", "Watch", "🟡"), ("avoid", "Avoid", "🔴")]
+WEB_LIMIT = 10  # most stocks shown per section on the page; the PDF always has them all
+
+
+def more_note(total, what):
+    """Caption saying how many rows were left off the page, if any."""
+    if total > WEB_LIMIT:
+        st.caption(f"Showing the first {WEB_LIMIT} of {total} {what}. "
+                   "The full list is in the PDF report.")
 
 EMAIL_RE = re.compile(r"[^@\s<>()]+@[^@\s<>()]+\.[^@\s<>()]+")
 HEADER_WORDS = {"TICKER", "TICKERS", "SYMBOL", "SYMBOLS", "STOCK", "STOCKS"}
@@ -156,13 +164,14 @@ if results:
             [{"Weight": h["weight_pct"], "Ticker": h["ticker"], "Company": h["company"],
               "Recommendation": (h["recommendation"] or "skipped").capitalize(),
               "Strength": (h["financial_strength"] or "").capitalize(),
-              "Score": h["score"]} for h in info["rows"]],
+              "Score": h["score"]} for h in info["rows"][:WEB_LIMIT]],
             hide_index=True, width="stretch",
             column_config={"Score": score_col,
                            "Weight": st.column_config.NumberColumn(
                                "Weight", format="%.2f%%",
                                help="Percent of the fund held in this company")},
         )
+        more_note(len(info["rows"]), "holdings (biggest first)")
 
     listed = [r for r in ok if not r.get("etfs")] if etfs else ok
     if listed:
@@ -171,12 +180,15 @@ if results:
             [{"Ticker": r["ticker"], "Company": r["company"],
               "Recommendation": r["recommendation"].capitalize(),
               "Strength": r["financial_strength"].capitalize(),
-              "Score": r["score"]} for r in listed],
+              "Score": r["score"]} for r in listed[:WEB_LIMIT]],
             hide_index=True, width="stretch", column_config={"Score": score_col},
         )
+        more_note(len(listed), "stocks (highest score first)")
 
+    ordered = [r for key, _, _ in GROUPS for r in ok if r["recommendation"] == key]
+    detailed = ordered[:WEB_LIMIT]
     for key, label, dot in GROUPS:
-        group = [r for r in ok if r["recommendation"] == key]
+        group = [r for r in detailed if r["recommendation"] == key]
         if not group:
             continue
         st.subheader(f"{dot} {label}")
@@ -194,11 +206,19 @@ if results:
                     links.append(f"[10-Q, filed {f['10-Q']['filed']}]({f['10-Q']['url']})")
                 st.caption(" · ".join(links))
 
+    if len(ordered) > WEB_LIMIT:
+        hidden = ordered[WEB_LIMIT:]
+        counts = ", ".join(f"{n} {label.lower()}" for key, label, _ in GROUPS
+                           if (n := sum(r["recommendation"] == key for r in hidden)))
+        st.info(f"Showing the write-ups for the first {WEB_LIMIT} of {len(ordered)} stocks. "
+                f"The other {len(hidden)} ({counts}) are in the PDF report.")
+
     if errors:
         st.subheader("Skipped")
-        for r in errors:
+        for r in errors[:WEB_LIMIT]:
             tag = f" ({screener.etf_tag(r)})" if r.get("etfs") else ""
             st.warning(f"**{r['ticker']}**{tag}: {r['error']}")
+        more_note(len(errors), "skipped symbols")
 
     left, right = st.columns(2)
     try:
