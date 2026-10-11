@@ -1,7 +1,7 @@
 """
 Simple web UI for screener.py. Keep this file in the same folder as screener.py.
 
-    pip install streamlit anthropic requests
+    pip install streamlit anthropic requests fpdf2
     streamlit run app.py
 
 It opens in your browser at http://localhost:8501 and runs only on your computer.
@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+from datetime import date
 
 import streamlit as st
 
@@ -182,7 +183,14 @@ if results:
         for r in errors:
             st.warning(f"**{r['ticker']}**: {r['error']}")
 
-    st.download_button("Download full results (JSON)", json.dumps(results, indent=2),
-                       file_name="results.json", mime="application/json")
+    left, right = st.columns(2)
+    try:
+        left.download_button("Download report (PDF)", screener.build_pdf(results),
+                             file_name=f"stock-screen-{date.today()}.pdf",
+                             mime="application/pdf", type="primary")
+    except Exception as exc:
+        left.warning(f"PDF unavailable: {exc}")
+    right.download_button("Download full results (JSON)", json.dumps(results, indent=2),
+                          file_name="results.json", mime="application/json")
     st.caption("A “buy” here means the business is financially strong. No price or "
                "valuation data is used, and this is not financial advice.")

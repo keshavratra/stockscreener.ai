@@ -4,7 +4,7 @@ Crude stock screener: tickers in -> latest 10-K / 10-Q from SEC EDGAR -> Claude
 judges financial strength -> ranked picks with 2-3 bullets of reasoning.
 
 Setup:
-    pip install anthropic requests
+    pip install anthropic requests fpdf2
     Windows PowerShell:
         $env:ANTHROPIC_API_KEY = "sk-ant-..."
         $env:SEC_USER_AGENT = "Your Name you@example.com"   # SEC requires a contact
@@ -16,7 +16,8 @@ Usage:
     python screener.py AAPL MSFT F
     python screener.py --file tickers.txt        # one ticker per line
 Output:
-    Ranked summary printed to the terminal, full detail in results.json
+    Ranked summary printed to the terminal, full detail in results.json,
+    and a readable report in results.pdf (change with --pdf, skip with --no-pdf)
 """
 import argparse
 import json
@@ -190,6 +191,130 @@ def assess(client, ticker, name, filings, financials):
     raise ValueError("model replied without a structured assessment; try again")
 
 
+# ---------------------------------------------------------------------- PDF
+
+_PDF_SWAPS = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-",
+              "\u2014": "-", "\u2212": "-", "\u2022": "-", "\u2026": "...", "\u00a0": " ",
+              "\u2010": "-", "\u2011": "-",
+              "\u2248": "~", "\u2265": ">=", "\u2264": "<=", "\u2192": "->", "\u00d7": "x"}
+_PDF_COLORS = {"buy": (22, 130, 70), "watch": (190, 130, 0), "avoid": (190, 45, 45)}
+
+
+def _pdf_text(text):
+    """The PDF's built-in fonts only cover Latin-1; swap or drop anything else."""
+    text = str(text)
+    for bad, good in _PDF_SWAPS.items():
+        text = text.replace(bad, good)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def build_pdf(results):
+    """Render the screening results as a PDF report and return it as bytes."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise RuntimeError("PDF output needs the fpdf2 package: pip install fpdf2")
+
+    class Report(FPDF):
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", size=8)
+            self.set_text_color(130)
+            self.cell(0, 5, f"Page {self.page_no()}", align="C")
+
+    pdf = Report(format="letter")
+    pdf.set_margins(18, 16, 18)
+    pdf.set_auto_page_break(True, margin=16)
+    pdf.add_page()
+    width = pdf.epw
+
+    def line(text, size=10, style="", color=(30, 30, 30), height=5, indent=0, link=""):
+        pdf.set_font("Helvetica", style, size)
+        pdf.set_text_color(*color)
+        pdf.set_x(pdf.l_margin + indent)
+        pdf.multi_cell(width - indent, height, _pdf_text(text), link=link,
+                       new_x="LMARGIN", new_y="NEXT")
+
+    ok = sorted((r for r in results if "error" not in r), key=lambda r: -r["score"])
+    errors = [r for r in results if "error" in r]
+
+    line("Stock Screener Report", size=18, style="B", height=9)
+    line(f"{date.today():%B %d, %Y}  |  {len(ok)} screened"
+         + (f", {len(errors)} skipped" if errors else ""), size=9, color=(110, 110, 110))
+    pdf.ln(4)
+
+    if ok:  # summary table
+        cols = [("Ticker", 0.12), ("Company", 0.44), ("Recommendation", 0.18),
+                ("Strength", 0.14), ("Score", 0.12)]
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(235, 238, 242)
+        pdf.set_text_color(30, 30, 30)
+        for title, frac in cols:
+            pdf.cell(width * frac, 7, title, border="B", fill=True)
+        pdf.ln()
+        for r in ok:
+            cells = [r["ticker"], r["company"], r["recommendation"].capitalize(),
+                     r["financial_strength"].capitalize(), f"{r['score']} / 10"]
+            for i, ((_, frac), text) in enumerate(zip(cols, cells)):
+                text = _pdf_text(text)
+                pdf.set_font("Helvetica", "B" if i in (0, 2) else "", 9)
+                while len(text) > 4 and pdf.get_string_width(text) > width * frac - 3:
+                    text = text[:-4] + "..."   # trim long company names to fit
+                pdf.set_text_color(*(_PDF_COLORS[r["recommendation"]] if i == 2
+                                     else (30, 30, 30)))
+                pdf.cell(width * frac, 6.5, text, border="B")
+            pdf.ln()
+        pdf.ln(5)
+
+    for heading, rec in (("Buy", "buy"), ("Watch", "watch"), ("Avoid", "avoid")):
+        group = [r for r in ok if r["recommendation"] == rec]
+        if not group:
+            continue
+        if pdf.will_page_break(40):
+            pdf.add_page()
+        line(heading, size=13, style="B", color=_PDF_COLORS[rec], height=7)
+        pdf.set_draw_color(*_PDF_COLORS[rec])
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + width, pdf.get_y())
+        pdf.ln(2)
+        for r in group:
+            if pdf.will_page_break(30):   # keep a company's heading with its bullets
+                pdf.add_page()
+            line(f"{r['ticker']}  -  {r['company']}", size=11, style="B", height=6)
+            line(f"{r['financial_strength'].capitalize()}  |  {r['score']}/10",
+                 size=9, color=(110, 110, 110))
+            pdf.ln(1)
+            for bullet in r["reasoning"]:
+                top = pdf.get_y()
+                line("-", indent=2)
+                pdf.set_y(top)
+                line(bullet, indent=6)
+            if r["data_gaps"].strip().lower() != "none":
+                line(f"Data gaps: {r['data_gaps']}", size=9, style="I",
+                     color=(110, 110, 110), indent=6)
+            for form in ("10-K", "10-Q"):
+                if form in r["filings"]:
+                    f = r["filings"][form]
+                    line(f"{form}, filed {f['filed']}", size=9, style="U",
+                         color=(30, 90, 170), indent=6, link=f["url"])
+            pdf.ln(4)
+
+    if errors:
+        line("Skipped", size=13, style="B", height=7)
+        for r in errors:
+            line(f"{r['ticker']}: {r['error']}", size=9)
+        pdf.ln(3)
+
+    line('A "buy" here means the business is financially strong. No price or valuation '
+         "data is used, and this is not financial advice.", size=8, style="I",
+         color=(110, 110, 110), height=4)
+    return bytes(pdf.output())
+
+
+def save_pdf(results, path):
+    with open(path, "wb") as fh:
+        fh.write(build_pdf(results))
+
+
 # --------------------------------------------------------------------- main
 
 def screen(tickers):
@@ -246,6 +371,8 @@ def main():
     parser.add_argument("tickers", nargs="*", help="e.g. AAPL MSFT F")
     parser.add_argument("--file", help="text file with one ticker per line")
     parser.add_argument("--out", default="results.json")
+    parser.add_argument("--pdf", default="results.pdf", help="where to save the PDF report")
+    parser.add_argument("--no-pdf", action="store_true", help="skip the PDF report")
     args = parser.parse_args()
 
     tickers = list(args.tickers)
@@ -264,6 +391,12 @@ def main():
         json.dump(results, fh, indent=2)
     print_report(results)
     print(f"\nFull detail saved to {args.out}")
+    if not args.no_pdf:
+        try:
+            save_pdf(results, args.pdf)
+            print(f"PDF report saved to {args.pdf}")
+        except Exception as exc:  # e.g. fpdf2 missing, or the PDF is open in a viewer
+            print(f"Could not write the PDF: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
