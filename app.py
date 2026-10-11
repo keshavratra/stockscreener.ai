@@ -19,6 +19,7 @@ import screener
 st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="centered")
 
 GROUPS = [("buy", "Buy", "🟢"), ("watch", "Watch", "🟡"), ("avoid", "Avoid", "🔴")]
+FIT_DOTS = {"favorable": "🟢", "neutral": "⚪", "unfavorable": "🔴"}
 WEB_LIMIT = 10  # most stocks shown per section on the page; the PDF always has them all
 
 
@@ -77,6 +78,13 @@ with st.sidebar:
                           placeholder="you@example.com",
                           help="The SEC requires a contact email on every data request. "
                                "It is sent only to the SEC.").strip()
+    st.subheader("Market snapshot")
+    fred_key = st.text_input("FRED key", type="password",
+                             value=os.environ.get("FRED_API_KEY", ""),
+                             help="Supplies the market data (rates, inflation, VIX, S&P 500) "
+                                  "for the snapshot and the market-fit ratings. Free at "
+                                  "fred.stlouisfed.org/docs/api/api_key.html. Leave it "
+                                  "blank to screen without them.").strip()
     st.subheader("ETFs")
     av_key = st.text_input("Alpha Vantage key", type="password",
                            value=os.environ.get("ALPHAVANTAGE_API_KEY", ""),
@@ -92,8 +100,9 @@ api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # -------------------------------------------------------------------- input
 st.title("📈 Stock Screener")
-st.caption("Rates financial strength from each company's latest 10-K and 10-Q. "
-           "Enter an ETF to screen the companies it holds.")
+st.caption("Rates financial strength from each company's latest 10-K and 10-Q, and how "
+           "well it fits current market conditions. Enter an ETF to screen the "
+           "companies it holds.")
 
 raw = st.text_area("Stocks or ETFs to screen", placeholder="AAPL, MSFT, SPY",
                    help="Ticker symbols separated by commas, spaces, or new lines.")
@@ -128,19 +137,52 @@ if run:
     except Exception as exc:
         st.error(f"Could not reach the SEC: {exc}")
         st.stop()
-    bar = st.progress(0.0, text="Looking up tickers and ETF holdings")
-    results, etfs = screener.screen(
+    bar = st.progress(0.0, text="Reading market conditions and looking up tickers")
+    results, etfs, market = screener.screen(
         tickers, client=client, cik_map=lookup, av_key=av_key, etf_top=int(etf_top),
+        fred_key=fred_key,
         progress=lambda i, n, t: bar.progress(i / n, text=f"Analyzing {t} ({i + 1} of {n})"))
     bar.empty()
     st.session_state["results"] = results
     st.session_state["etfs"] = etfs
+    st.session_state["market"] = market
 
 # ------------------------------------------------------------------ results
 results = st.session_state.get("results")
 etfs = st.session_state.get("etfs") or []
+market = st.session_state.get("market")
+with_fit = screener.has_snapshot(market)
+
+
+def fit_label(row):
+    fit = row.get("market_fit")
+    return f"{FIT_DOTS[fit]} {fit.capitalize()}" if fit else ""
+
+
 if results:
-    ok = sorted((r for r in results if "error" not in r), key=lambda r: -r["score"])
+    # The market snapshot comes before any stock analysis.
+    if with_fit:
+        st.subheader("Market snapshot")
+        st.markdown(f"**{market['regime']}**  \n{market['summary']}")
+        st.dataframe(
+            [{"Indicator": i["name"], "Latest": screener.indicator_text(i),
+              "3 months ago": screener.indicator_text(i, "three_months_ago"),
+              "1 year ago": screener.indicator_text(i, "one_year_ago"),
+              "As of": i["date"]} for i in market["indicators"]],
+            hide_index=True, width="stretch")
+        st.markdown("\n".join(f"- {b}" for b in market["conditions"]))
+        left, right = st.columns(2)
+        left.markdown("**Conditions favor**\n" + "\n".join(f"- {b}" for b in market["favors"]))
+        right.markdown("**Conditions work against**\n"
+                       + "\n".join(f"- {b}" for b in market["works_against"]))
+        st.caption("Source: Federal Reserve Economic Data (FRED). Some series are weeks "
+                   "behind; see the As of dates. This describes conditions and is not "
+                   "a forecast.")
+    elif market:
+        st.warning(f"Market snapshot unavailable: {market['error']}")
+
+    ok = screener.ranked(results)
+    by_ticker = {r["ticker"]: r for r in results}
     errors = [r for r in results if "error" in r]
     score_col = st.column_config.ProgressColumn("Score", min_value=0, max_value=10,
                                                 format="%d / 10")
@@ -164,7 +206,9 @@ if results:
             [{"Weight": h["weight_pct"], "Ticker": h["ticker"], "Company": h["company"],
               "Recommendation": (h["recommendation"] or "skipped").capitalize(),
               "Strength": (h["financial_strength"] or "").capitalize(),
-              "Score": h["score"]} for h in info["rows"][:WEB_LIMIT]],
+              "Score": h["score"],
+              **({"Market fit": fit_label(by_ticker.get(h["ticker"], {}))} if with_fit else {})}
+             for h in info["rows"][:WEB_LIMIT]],
             hide_index=True, width="stretch",
             column_config={"Score": score_col,
                            "Weight": st.column_config.NumberColumn(
@@ -180,7 +224,9 @@ if results:
             [{"Ticker": r["ticker"], "Company": r["company"],
               "Recommendation": r["recommendation"].capitalize(),
               "Strength": r["financial_strength"].capitalize(),
-              "Score": r["score"]} for r in listed[:WEB_LIMIT]],
+              "Score": r["score"],
+              **({"Market fit": fit_label(r)} if with_fit else {})}
+             for r in listed[:WEB_LIMIT]],
             hide_index=True, width="stretch", column_config={"Score": score_col},
         )
         more_note(len(listed), "stocks (highest score first)")
@@ -200,6 +246,9 @@ if results:
                 st.markdown("\n".join(f"- {b}" for b in r["reasoning"]))
                 if r["data_gaps"].strip().lower() != "none":
                     st.caption(f"Data gaps: {r['data_gaps']}")
+                if r.get("market_fit"):
+                    st.markdown(f"**Market fit: {fit_label(r)}**\n" + "\n".join(
+                        f"- {b}" for b in r.get("market_fit_reasoning", [])))
                 f = r["filings"]
                 links = [f"[10-K, filed {f['10-K']['filed']}]({f['10-K']['url']})"]
                 if "10-Q" in f:
@@ -222,12 +271,15 @@ if results:
 
     left, right = st.columns(2)
     try:
-        left.download_button("Download report (PDF)", screener.build_pdf(results, etfs),
+        left.download_button("Download report (PDF)", screener.build_pdf(results, etfs, market),
                              file_name=f"stock-screen-{date.today()}.pdf",
                              mime="application/pdf", type="primary")
     except Exception as exc:
         left.warning(f"PDF unavailable: {exc}")
-    right.download_button("Download full results (JSON)", screener.to_json(results, etfs),
+    right.download_button("Download full results (JSON)", screener.to_json(results, etfs, market),
                           file_name="results.json", mime="application/json")
-    st.caption("A “buy” here means the business is financially strong. No price or "
+    st.caption("A “buy” here means the business is financially strong, judged on its "
+               "filings alone." + (" Market fit is a separate rating of how the company's "
+               "finances and industry suit current conditions; it does not change the "
+               "buy / watch / avoid call." if with_fit else "") + " No price or "
                "valuation data is used, and this is not financial advice.")

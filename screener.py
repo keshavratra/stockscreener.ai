@@ -3,7 +3,9 @@
 Crude stock screener: tickers in -> latest 10-K / 10-Q from SEC EDGAR -> Claude
 judges financial strength -> ranked picks with 2-3 bullets of reasoning.
 Give it an ETF and it screens the companies the fund holds instead, and
-reports what percent of the fund each one makes up.
+reports what percent of the fund each one makes up. With a FRED key it opens
+with a snapshot of current market conditions and gives every stock a
+market-fit rating.
 
 Setup:
     pip install anthropic requests fpdf2
@@ -11,18 +13,24 @@ Setup:
         $env:ANTHROPIC_API_KEY = "sk-ant-..."
         $env:SEC_USER_AGENT = "Your Name you@example.com"   # SEC requires a contact
         $env:ALPHAVANTAGE_API_KEY = "..."                   # only needed for ETFs
+        $env:FRED_API_KEY = "..."                           # market snapshot
     Mac / Linux:
         export ANTHROPIC_API_KEY=sk-ant-...
         export SEC_USER_AGENT="Your Name you@example.com"
         export ALPHAVANTAGE_API_KEY=...                     # only needed for ETFs
+        export FRED_API_KEY=...                             # market snapshot
     The Alpha Vantage key supplies ETF holdings; get one free at
     https://www.alphavantage.co/support/#api-key
+    The FRED key supplies the market data (rates, inflation, VIX, S&P 500); get
+    one free at https://fred.stlouisfed.org/docs/api/api_key.html
+    Without it the screener still runs, with no snapshot or market-fit ratings.
 
 Usage:
     python screener.py AAPL MSFT F
     python screener.py SPY                       # top 25 holdings of the ETF
     python screener.py SPY --etf-top 100         # top 100 (0 = every holding)
     python screener.py --file tickers.txt        # one ticker per line
+    python screener.py AAPL --no-market          # skip the market snapshot
 Output:
     Ranked summary printed to the terminal, full detail in results.json,
     and a readable report in results.pdf (change with --pdf, skip with --no-pdf)
@@ -33,7 +41,7 @@ import os
 import re
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import requests
 
@@ -110,9 +118,14 @@ def load_cik_map():
     return {row["ticker"].upper(): (row["cik_str"], row["title"]) for row in data.values()}
 
 
+INDUSTRY = {}  # cik -> SEC industry description, filled in by latest_filings()
+
+
 def latest_filings(cik):
     """Most recent 10-K and 10-Q: accession number, dates, and a link."""
-    recent = sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json")["filings"]["recent"]
+    submissions = sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json")
+    INDUSTRY[cik] = submissions.get("sicDescription") or ""
+    recent = submissions["filings"]["recent"]
     found = {}
     for i, form in enumerate(recent["form"]):  # newest first
         if form in ("10-K", "10-Q") and form not in found:
@@ -177,14 +190,27 @@ def extract_financials(companyfacts, q_accession):
 
 # ------------------------------------------------------------------- Claude
 
-def assess(client, ticker, name, filings, financials):
+def assess(client, ticker, name, filings, financials, market=None, industry=""):
+    """Claude's assessment of one company. With a market snapshot, it also
+    returns market_fit and market_fit_reasoning."""
     payload = {"ticker": ticker, "company": name, "filings": filings,
                "financials_usd": financials}
+    system, tool = SYSTEM_PROMPT, ASSESSMENT_TOOL
+    if market:
+        payload["industry"] = industry or "unknown"
+        payload["market_snapshot"] = {k: market[k] for k in (
+            "as_of", "regime", "summary", "conditions", "favors", "works_against",
+            "indicators")}
+        system += MARKET_FIT_RULES
+        schema = ASSESSMENT_TOOL["input_schema"]
+        tool = {**ASSESSMENT_TOOL, "input_schema": {
+            **schema, "properties": {**schema["properties"], **MARKET_FIT_FIELDS},
+            "required": schema["required"] + list(MARKET_FIT_FIELDS)}}
     resp = client.messages.create(
         model=MODEL,
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        tools=[ASSESSMENT_TOOL],
+        system=system,
+        tools=[tool],
         messages=[{
             "role": "user",
             "content": ("Assess this company and report the result by calling the "
@@ -198,6 +224,193 @@ def assess(client, ticker, name, filings, financials):
         if block.type == "tool_use":
             return block.input
     raise ValueError("model replied without a structured assessment; try again")
+
+
+# ------------------------------------------------------------------- market
+
+# (label, FRED series id, unit, how often it updates, FRED "units" transform)
+FRED_SERIES = [
+    ("Fed funds rate", "DFF", "%", "daily", None),
+    ("2-year Treasury yield", "DGS2", "%", "daily", None),
+    ("10-year Treasury yield", "DGS10", "%", "daily", None),
+    ("Yield curve (10-year minus 2-year)", "T10Y2Y", "pts", "daily", None),
+    ("Inflation (CPI, year over year)", "CPIAUCSL", "%", "monthly", "pc1"),
+    ("Unemployment rate", "UNRATE", "%", "monthly", None),
+    ("VIX (expected stock volatility)", "VIXCLS", "", "daily", None),
+    ("High-yield credit spread", "BAMLH0A0HYM2", "pts", "daily", None),
+    ("S&P 500", "SP500", "", "daily", None),
+]
+FIT_ORDER = {"favorable": 0, "neutral": 1, "unfavorable": 2}
+
+SNAPSHOT_TOOL = {
+    "name": "record_market_snapshot",
+    "description": "Record a read on current market conditions.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "regime": {"type": "string",
+                       "description": "A label of 3-7 words, e.g. 'High rates, calm markets'."},
+            "summary": {"type": "string", "description": "1-2 plain sentences."},
+            "conditions": {"type": "array", "items": {"type": "string"},
+                           "description": "3-4 short bullets, each citing specific figures."},
+            "favors": {"type": "array", "items": {"type": "string"},
+                       "description": "2-3 company traits these conditions tend to reward."},
+            "works_against": {"type": "array", "items": {"type": "string"},
+                              "description": "2-3 company traits these conditions tend to hurt."},
+        },
+        "required": ["regime", "summary", "conditions", "favors", "works_against"],
+    },
+}
+
+SNAPSHOT_PROMPT = """You are a macro analyst writing a short read on current US market conditions
+for someone choosing between individual stocks.
+
+You are given indicators from the Federal Reserve's FRED database: the latest value, its
+date, and the values about 3 months and 1 year earlier.
+
+Rules:
+- Use only the numbers provided. Never invent or recall figures or recent events.
+- Cover the level and direction of interest rates, inflation and jobs, risk appetite
+  (VIX, credit spreads), and the stock market's trend.
+- "favors" and "works_against" must be company characteristics that can be checked in
+  financial statements or by industry (for example low debt, strong interest coverage,
+  large cash balance, steady cash flow, cyclical vs defensive industry).
+- This is a description of conditions, not a forecast. Some data is weeks old; the dates
+  are given, so do not present stale figures as today's.
+- If an indicator is missing, work without it."""
+
+MARKET_FIT_RULES = """
+
+You are also given the company's industry and a market_snapshot of current macro conditions.
+- Judge financial_strength, score, recommendation and reasoning on the filings alone,
+  exactly as you would with no snapshot.
+- Separately rate market_fit: how well this company's debt load, interest coverage,
+  liquidity, cash generation, margins and industry suit the conditions in the snapshot.
+  "favorable" means its traits match what the snapshot favors, "unfavorable" means it is
+  exposed to what the snapshot works against, "neutral" means mixed or little affected.
+- market_fit_reasoning: 2-3 short bullets, each tying a specific company figure (or its
+  industry) to a specific condition in the snapshot.
+- Market fit is not a price forecast. For macro, use only the snapshot's figures."""
+
+MARKET_FIT_FIELDS = {
+    "market_fit": {"type": "string", "enum": ["favorable", "neutral", "unfavorable"]},
+    "market_fit_reasoning": {
+        "type": "array", "items": {"type": "string"},
+        "description": "2-3 short bullets linking company figures to the market snapshot.",
+    },
+}
+
+
+def fred_series(series_id, api_key, limit, units=None):
+    """Newest-first [(date, value)] for one FRED series, missing values dropped."""
+    params = {"series_id": series_id, "api_key": api_key, "file_type": "json",
+              "sort_order": "desc", "limit": limit}
+    if units:
+        params["units"] = units
+    resp = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                        params=params, timeout=30)
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise
+    if "observations" not in data:
+        raise ValueError(f"FRED says: {data.get('error_message') or resp.status_code}")
+    out = []
+    for obs in data["observations"]:
+        try:
+            out.append((date.fromisoformat(obs["date"]), float(obs["value"])))
+        except (KeyError, ValueError):
+            continue  # FRED marks holidays and gaps with "."
+    return out
+
+
+def _as_of(obs, when):
+    """The value in effect on a past date (first observation at or before it)."""
+    return next((v for d, v in obs if d <= when), None)
+
+
+def market_indicators(api_key):
+    """Latest reading of each indicator, with 3-month and 1-year comparisons."""
+    out, problems = [], []
+    for label, series, unit, freq, units in FRED_SERIES:
+        try:
+            obs = fred_series(series, api_key, 400 if freq == "daily" else 16, units)
+            if not obs:
+                raise ValueError("no data returned")
+        except Exception as exc:
+            problems.append(f"{label}: {exc}")
+            continue
+        day, latest = obs[0]
+        out.append({"name": label, "series": series, "unit": unit, "date": day.isoformat(),
+                    "latest": round(latest, 2),
+                    "three_months_ago": _round(_as_of(obs, day - timedelta(days=91))),
+                    "one_year_ago": _round(_as_of(obs, day - timedelta(days=365)))})
+        if series == "SP500" and len(obs) >= 200:
+            average = sum(v for _, v in obs[:200]) / 200
+            out.append({"name": "S&P 500 vs its 200-day average", "series": "SP500",
+                        "unit": "gap", "date": day.isoformat(),
+                        "latest": round((latest / average - 1) * 100, 1),
+                        "three_months_ago": None, "one_year_ago": None})
+    if not out:
+        raise ValueError(problems[0] if problems else "no market data available")
+    return out
+
+
+def _round(value):
+    return None if value is None else round(value, 2)
+
+
+def indicator_text(ind, key="latest"):
+    """A reading formatted with its unit, e.g. '4.33%', '+0.52 pts', '5,812.40'."""
+    value = ind.get(key)
+    if value is None:
+        return "-"
+    if ind["unit"] == "%":
+        return f"{value:.2f}%"
+    if ind["unit"] == "pts":
+        return f"{value:+.2f} pts"
+    if ind["unit"] == "gap":
+        return f"{value:+.1f}%"
+    return f"{value:,.2f}"
+
+
+def market_snapshot(client, fred_key):
+    """Macro indicators plus Claude's read on them. Problems come back as {"error": ...}."""
+    try:
+        indicators = market_indicators(fred_key)
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=SNAPSHOT_PROMPT,
+            tools=[SNAPSHOT_TOOL],
+            messages=[{
+                "role": "user",
+                "content": ("Describe current conditions by calling the record_market_snapshot "
+                            "tool exactly once. Units: '%' is a percent level, 'pts' is "
+                            "percentage points, 'gap' is the percent the S&P 500 sits above "
+                            "(+) or below (-) its 200-day average.\n\n"
+                            + json.dumps({"today": date.today().isoformat(),
+                                          "indicators": indicators}, indent=1)),
+            }],
+        )
+        for block in resp.content:
+            if block.type == "tool_use":
+                return {"as_of": date.today().isoformat(), **block.input,
+                        "indicators": indicators}
+        raise ValueError("model replied without a structured snapshot; try again")
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def has_snapshot(market):
+    return bool(market) and "error" not in market
+
+
+def ranked(results):
+    """Rated rows, best first: by score, then by market fit when scores tie."""
+    return sorted((r for r in results if "error" not in r),
+                  key=lambda r: (-r["score"], FIT_ORDER.get(r.get("market_fit"), 1)))
 
 
 # --------------------------------------------------------------------- ETFs
@@ -331,6 +544,8 @@ _PDF_SWAPS = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u201
               "\u2010": "-", "\u2011": "-",
               "\u2248": "~", "\u2265": ">=", "\u2264": "<=", "\u2192": "->", "\u00d7": "x"}
 _PDF_COLORS = {"buy": (22, 130, 70), "watch": (190, 130, 0), "avoid": (190, 45, 45)}
+_FIT_COLORS = {"favorable": (22, 130, 70), "neutral": (110, 110, 110),
+               "unfavorable": (190, 45, 45)}
 
 
 def _pdf_text(text):
@@ -341,7 +556,7 @@ def _pdf_text(text):
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def build_pdf(results, etfs=()):
+def build_pdf(results, etfs=(), market=None):
     """Render the screening results as a PDF report and return it as bytes."""
     try:
         from fpdf import FPDF
@@ -361,6 +576,7 @@ def build_pdf(results, etfs=()):
     pdf.add_page()
     width = pdf.epw
     dark, grey = (30, 30, 30), (110, 110, 110)
+    with_fit = has_snapshot(market)
 
     def line(text, size=10, style="", color=dark, height=5, indent=0, link=""):
         pdf.set_font("Helvetica", style, size)
@@ -368,6 +584,14 @@ def build_pdf(results, etfs=()):
         pdf.set_x(pdf.l_margin + indent)
         pdf.multi_cell(width - indent, height, _pdf_text(text), link=link,
                        new_x="LMARGIN", new_y="NEXT")
+
+    def bullets(items, size=10, indent=2):
+        for item in items:
+            top, page = pdf.get_y(), pdf.page
+            line("-", size=size, indent=indent)
+            if pdf.page == page:
+                pdf.set_y(top)
+            line(item, size=size, indent=indent + 4)
 
     def table(cols, rows):
         """cols: [(title, fraction of page width)]; rows: lists of (text, style, color)."""
@@ -398,13 +622,47 @@ def build_pdf(results, etfs=()):
             return ("Skipped", "", grey)
         return (rec.capitalize(), "B", _PDF_COLORS[rec])
 
-    ok = sorted((r for r in results if "error" not in r), key=lambda r: -r["score"])
+    def fit_cell(fit):
+        if not fit:
+            return ("-", "", grey)
+        return (fit.capitalize(), "B", _FIT_COLORS[fit])
+
+    ok = ranked(results)
+    by_ticker = {r["ticker"]: r for r in results}
     errors = [r for r in results if "error" in r]
 
     line("Stock Screener Report", size=18, style="B", height=9)
     line(f"{date.today():%B %d, %Y}  |  {len(ok)} screened"
          + (f", {len(errors)} skipped" if errors else ""), size=9, color=grey)
     pdf.ln(4)
+
+    if with_fit:  # market snapshot comes before any stock analysis
+        line("Market snapshot", size=13, style="B", height=7)
+        line(market["regime"], size=11, style="B", height=6)
+        line(market["summary"])
+        pdf.ln(2)
+        table([("Indicator", 0.40), ("Latest", 0.16), ("3 months ago", 0.16),
+               ("1 year ago", 0.14), ("As of", 0.14)],
+              [[(i["name"], "", dark), (indicator_text(i), "B", dark),
+                (indicator_text(i, "three_months_ago"), "", dark),
+                (indicator_text(i, "one_year_ago"), "", dark), (i["date"], "", grey)]
+               for i in market["indicators"]])
+        pdf.set_y(pdf.get_y() - 2)
+        bullets(market["conditions"])
+        pdf.ln(2)
+        line("Conditions favor", style="B")
+        bullets(market["favors"])
+        pdf.ln(1)
+        line("Conditions work against", style="B")
+        bullets(market["works_against"])
+        pdf.ln(1)
+        line("Source: Federal Reserve Economic Data (FRED). Some series are weeks behind; "
+             "see the As of dates. This describes conditions and is not a forecast.",
+             size=8, style="I", color=grey, height=4)
+        pdf.ln(5)
+    elif market:
+        line(f"Market snapshot unavailable: {market['error']}", size=9, color=grey)
+        pdf.ln(4)
 
     for etf in etfs:  # one holdings table per ETF, biggest holding first
         info = etf_breakdown(etf, results)
@@ -423,25 +681,35 @@ def build_pdf(results, etfs=()):
             line(f"Weight-averaged score of the rated holdings: "
                  f"{info['weighted_score']:.1f} / 10", size=9)
         pdf.ln(2)
-        table([("Weight", 0.11), ("Ticker", 0.11), ("Company", 0.38),
-               ("Recommendation", 0.17), ("Strength", 0.13), ("Score", 0.10)],
-              [[(f"{h['weight_pct']:.2f}%", "", dark), (h["ticker"], "B", dark),
-                (h["company"], "", dark), rec_cell(h["recommendation"]),
-                ((h["financial_strength"] or "-").capitalize(), "", dark),
-                (f"{h['score']} / 10" if h["score"] is not None else "-", "", dark)]
-               for h in info["rows"]])
+        cols = [("Weight", 0.10), ("Ticker", 0.10), ("Company", 0.42 if not with_fit else 0.29),
+                ("Recommendation", 0.17), ("Strength", 0.12), ("Score", 0.09)]
+        rows = [[(f"{h['weight_pct']:.2f}%", "", dark), (h["ticker"], "B", dark),
+                 (h["company"], "", dark), rec_cell(h["recommendation"]),
+                 ((h["financial_strength"] or "-").capitalize(), "", dark),
+                 (f"{h['score']} / 10" if h["score"] is not None else "-", "", dark)]
+                for h in info["rows"]]
+        if with_fit:
+            cols.append(("Market fit", 0.13))
+            for h, cells in zip(info["rows"], rows):
+                cells.append(fit_cell(by_ticker.get(h["ticker"], {}).get("market_fit")))
+        table(cols, rows)
 
     listed = [r for r in ok if not r.get("etfs")] if etfs else ok
     if listed:  # summary table (stocks entered directly, when ETFs are also present)
         if etfs:
             line("Individual stocks", size=13, style="B", height=7)
             pdf.ln(1)
-        table([("Ticker", 0.12), ("Company", 0.44), ("Recommendation", 0.18),
-               ("Strength", 0.14), ("Score", 0.12)],
-              [[(r["ticker"], "B", dark), (r["company"], "", dark),
-                rec_cell(r["recommendation"]),
-                (r["financial_strength"].capitalize(), "", dark),
-                (f"{r['score']} / 10", "", dark)] for r in listed])
+        cols = [("Ticker", 0.11), ("Company", 0.47 if not with_fit else 0.34),
+                ("Recommendation", 0.18), ("Strength", 0.13), ("Score", 0.11)]
+        rows = [[(r["ticker"], "B", dark), (r["company"], "", dark),
+                 rec_cell(r["recommendation"]),
+                 (r["financial_strength"].capitalize(), "", dark),
+                 (f"{r['score']} / 10", "", dark)] for r in listed]
+        if with_fit:
+            cols.append(("Market fit", 0.13))
+            for r, cells in zip(listed, rows):
+                cells.append(fit_cell(r.get("market_fit")))
+        table(cols, rows)
 
     for heading, rec in (("Buy", "buy"), ("Watch", "watch"), ("Avoid", "avoid")):
         group = [r for r in ok if r["recommendation"] == rec]
@@ -462,14 +730,16 @@ def build_pdf(results, etfs=()):
                 sub += f"  |  {etf_tag(r)}"
             line(sub, size=9, color=grey)
             pdf.ln(1)
-            for bullet in r["reasoning"]:
-                top, page = pdf.get_y(), pdf.page
-                line("-", indent=2)
-                if pdf.page == page:
-                    pdf.set_y(top)
-                line(bullet, indent=6)
+            bullets(r["reasoning"])
             if r["data_gaps"].strip().lower() != "none":
                 line(f"Data gaps: {r['data_gaps']}", size=9, style="I", color=grey, indent=6)
+            if r.get("market_fit"):
+                pdf.ln(1)
+                if pdf.will_page_break(16):
+                    pdf.add_page()
+                line(f"Market fit: {r['market_fit'].capitalize()}", style="B",
+                     color=_FIT_COLORS[r["market_fit"]], indent=2)
+                bullets(r.get("market_fit_reasoning", []))
             for form in ("10-K", "10-Q"):
                 if form in r["filings"]:
                     f = r["filings"][form]
@@ -486,20 +756,24 @@ def build_pdf(results, etfs=()):
             line(f"{r['ticker']}{tag}: {r['error']}", size=9)
         pdf.ln(3)
 
-    line('A "buy" here means the business is financially strong. No price or valuation '
-         "data is used, and this is not financial advice.", size=8, style="I",
-         color=grey, height=4)
+    note = ('A "buy" here means the business is financially strong, judged on its filings '
+            "alone. ")
+    if with_fit:
+        note += ("Market fit is a separate rating of how the company's finances and industry "
+                 "suit current conditions; it does not change the buy / watch / avoid call. ")
+    line(note + "No price or valuation data is used, and this is not financial advice.",
+         size=8, style="I", color=grey, height=4)
     return bytes(pdf.output())
 
 
-def save_pdf(results, path, etfs=()):
+def save_pdf(results, path, etfs=(), market=None):
     with open(path, "wb") as fh:
-        fh.write(build_pdf(results, etfs))
+        fh.write(build_pdf(results, etfs, market))
 
 
 # --------------------------------------------------------------------- main
 
-def screen_one(client, cik_map, ticker, filings=None):
+def screen_one(client, cik_map, ticker, filings=None, market=None):
     """Screen one company. Failures come back as row['error'] instead of raising."""
     row = {"ticker": ticker}
     try:
@@ -511,20 +785,23 @@ def screen_one(client, cik_map, ticker, filings=None):
             raise ValueError("no 10-K on file (foreign filers use 20-F / 40-F)")
         facts = sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json")
         financials = extract_financials(facts, filings.get("10-Q", {}).get("accession"))
-        row.update(company=name, filings=filings,
-                   **assess(client, ticker, name, filings, financials))
+        row.update(company=name, industry=INDUSTRY.get(cik, ""), filings=filings,
+                   **assess(client, ticker, name, filings, financials,
+                            market=market, industry=INDUSTRY.get(cik, "")))
     except Exception as exc:  # one bad ticker shouldn't sink the run
         row["error"] = str(exc)
     return row
 
 
 def screen(tickers, client=None, cik_map=None, av_key="", etf_top=ETF_TOP_DEFAULT,
-           progress=None):
-    """Screen stocks and ETFs. Returns (results, etfs).
+           fred_key="", progress=None):
+    """Screen stocks and ETFs. Returns (results, etfs, market).
 
     An ETF is replaced by its holdings; each of those rows carries
     row["etfs"] = {etf ticker: percent of that fund}. A stock that shows up
     more than once (in two ETFs, or typed in as well) is only screened once.
+    With a FRED key, a market snapshot is built first and every company also
+    gets a market_fit rating; without one, market is None.
     progress(i, n, ticker) is called before each company, if given.
     """
     if client is None:
@@ -532,25 +809,51 @@ def screen(tickers, client=None, cik_map=None, av_key="", etf_top=ETF_TOP_DEFAUL
         client = anthropic.Anthropic()
     if cik_map is None:
         cik_map = load_cik_map()
+    market = market_snapshot(client, fred_key) if fred_key else None
     plan, etfs, errors = expand(tickers, cik_map, av_key, etf_top)
     results = [e for e in errors if e["ticker"] not in plan]  # else it is listed twice
     for i, (ticker, info) in enumerate(plan.items()):
         if progress:
             progress(i, len(plan), ticker)
-        row = screen_one(client, cik_map, ticker, info["filings"])
+        row = screen_one(client, cik_map, ticker, info["filings"],
+                         market if has_snapshot(market) else None)
         if info["etfs"]:
             row["etfs"] = info["etfs"]
         results.append(row)
-    return results, etfs
+    return results, etfs, market
 
 
-def to_json(results, etfs=()):
-    """results.json content: a plain list, or {"etfs", "results"} when ETFs were screened."""
-    return json.dumps({"etfs": list(etfs), "results": results} if etfs else results, indent=2)
+def to_json(results, etfs=(), market=None):
+    """results.json content: a plain list of rows, or, when a market snapshot or
+    ETFs are present, {"market", "etfs", "results"}."""
+    if not etfs and not market:
+        return json.dumps(results, indent=2)
+    return json.dumps({"market": market, "etfs": list(etfs), "results": results}, indent=2)
 
 
-def print_report(results, etfs=()):
-    ok = sorted((r for r in results if "error" not in r), key=lambda r: -r["score"])
+def print_report(results, etfs=(), market=None):
+    ok = ranked(results)
+    by_ticker = {r["ticker"]: r for r in results}
+    if has_snapshot(market):
+        print("\n=== MARKET SNAPSHOT ===")
+        print(market["regime"])
+        print(market["summary"])
+        print(f"\n  {'':<36}{'latest':>12}{'3 mo ago':>12}{'1 yr ago':>12}   as of")
+        for i in market["indicators"]:
+            print(f"  {i['name']:<36}{indicator_text(i):>12}"
+                  f"{indicator_text(i, 'three_months_ago'):>12}"
+                  f"{indicator_text(i, 'one_year_ago'):>12}   {i['date']}")
+        print()
+        for bullet in market["conditions"]:
+            print(f"  - {bullet}")
+        print("Conditions favor:")
+        for bullet in market["favors"]:
+            print(f"  - {bullet}")
+        print("Conditions work against:")
+        for bullet in market["works_against"]:
+            print(f"  - {bullet}")
+    elif market:
+        print(f"\nMarket snapshot unavailable: {market['error']}")
     for etf in etfs:
         info = etf_breakdown(etf, results)
         w = info["weights"]
@@ -564,7 +867,10 @@ def print_report(results, etfs=()):
         for h in info["rows"]:
             verdict = (f"{h['recommendation']:<6}{h['score']:>2}/10" if h["recommendation"]
                        else "skipped")
-            print(f"  {h['weight_pct']:6.2f}%  {h['ticker']:<7} {verdict:<12} {h['company']}")
+            fit = by_ticker.get(h["ticker"], {}).get("market_fit")
+            fit = f"fit: {fit:<12}" if fit else ""
+            print(f"  {h['weight_pct']:6.2f}%  {h['ticker']:<7} {verdict:<12} {fit}"
+                  f"{h['company']}")
     for heading, rec in (("BUY", "buy"), ("WATCH", "watch"), ("AVOID", "avoid")):
         group = [r for r in ok if r["recommendation"] == rec]
         if not group:
@@ -578,6 +884,10 @@ def print_report(results, etfs=()):
                 print(f"  - {bullet}")
             if r["data_gaps"].strip().lower() != "none":
                 print(f"  (gaps: {r['data_gaps']})")
+            if r.get("market_fit"):
+                print(f"  Market fit: {r['market_fit']}")
+                for bullet in r.get("market_fit_reasoning", []):
+                    print(f"    - {bullet}")
             print(f"  10-K: {r['filings']['10-K']['url']}")
             if "10-Q" in r["filings"]:
                 print(f"  10-Q: {r['filings']['10-Q']['url']}")
@@ -597,6 +907,8 @@ def main():
     parser.add_argument("--etf-top", type=int, default=ETF_TOP_DEFAULT, metavar="N",
                         help="for an ETF, screen its N biggest holdings "
                              f"(default {ETF_TOP_DEFAULT}; 0 = every holding)")
+    parser.add_argument("--no-market", action="store_true",
+                        help="skip the market snapshot and market-fit ratings")
     parser.add_argument("--out", default="results.json")
     parser.add_argument("--pdf", default="results.pdf", help="where to save the PDF report")
     parser.add_argument("--no-pdf", action="store_true", help="skip the PDF report")
@@ -612,17 +924,22 @@ def main():
     for var in ("ANTHROPIC_API_KEY", "SEC_USER_AGENT"):
         if not os.environ.get(var):
             sys.exit(f"Set the {var} environment variable first (see top of this file).")
+    fred_key = "" if args.no_market else os.environ.get("FRED_API_KEY", "")
+    if not fred_key and not args.no_market:
+        print("No FRED_API_KEY set, so the market snapshot is skipped "
+              "(see top of this file).", file=sys.stderr)
 
-    results, etfs = screen(
+    results, etfs, market = screen(
         tickers, av_key=os.environ.get("ALPHAVANTAGE_API_KEY", ""), etf_top=args.etf_top,
+        fred_key=fred_key,
         progress=lambda i, n, t: print(f"... {t} ({i + 1} of {n})", file=sys.stderr))
     with open(args.out, "w") as fh:
-        fh.write(to_json(results, etfs))
-    print_report(results, etfs)
+        fh.write(to_json(results, etfs, market))
+    print_report(results, etfs, market)
     print(f"\nFull detail saved to {args.out}")
     if not args.no_pdf:
         try:
-            save_pdf(results, args.pdf, etfs)
+            save_pdf(results, args.pdf, etfs, market)
             print(f"PDF report saved to {args.pdf}")
         except Exception as exc:  # e.g. fpdf2 missing, or the PDF is open in a viewer
             print(f"Could not write the PDF: {exc}", file=sys.stderr)
